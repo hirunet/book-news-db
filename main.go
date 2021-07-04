@@ -12,28 +12,35 @@ import (
 
 const openbdEndpoint = "https://api.openbd.jp/v1"
 
-var count int = 0
-var total int = 0
-
 func main() {
-  startTime := time.Now()
-  logMessage(fmt.Sprintf("start %v", startTime))
+  var joinedIsbnList string
+  var startTime = time.Now()
+  logMessage(fmt.Sprintf("データベース更新処理開始"))
+
+  var isbnListToUpdate = GetIsbnListToUpdate()
+  logMessage(fmt.Sprintf("isbnListToUpdate %d", len(isbnListToUpdate)))
+  joinedIsbnList = joinStringSlice(isbnListToUpdate)
+  updateBookInfo(joinedIsbnList)
+
   var coverage = getCoverage()
-  logMessage(fmt.Sprintf("coverage %v", len(coverage)))
+  logMessage(fmt.Sprintf("coverage %d", len(coverage)))
+
   var knownIsbnList = GetIsbnList()
-  logMessage(fmt.Sprintf("knownIsbnList %v", len(knownIsbnList)))
+  logMessage(fmt.Sprintf("knownIsbnList %d", len(knownIsbnList)))
+
   coverage = difference(coverage, knownIsbnList)
-  logMessage(fmt.Sprintf("defference %v", len(coverage)))
-  total = len(coverage)
+  logMessage(fmt.Sprintf("defference %d", len(coverage)))
 
   var chunkedCoverage = chunked(coverage, 10000)
-  var isbns string
   for _, chunk := range chunkedCoverage {
-    isbns = joinStringSlice(chunk)
-    getBookInfo(isbns)
+    joinedIsbnList = joinStringSlice(chunk)
+    getBookInfo(joinedIsbnList)
   }
-  logMessage(fmt.Sprintf("開始時刻 %v", startTime))
-  logMessage(fmt.Sprintf("終了時刻 %v", time.Now()))
+  logMessage(fmt.Sprintf("データベース更新処理完了"))
+  logMessage(fmt.Sprintf("開始時刻     %v", startTime))
+  logMessage(fmt.Sprintf("終了時刻     %v", time.Now()))
+  logMessage(fmt.Sprintf("更新件数     %d", len(isbnListToUpdate)))
+  logMessage(fmt.Sprintf("新規取得件数 %d", len(coverage)))
 }
 
 // go - How to find the difference between two slices of strings - Stack Overflow https://stackoverflow.com/questions/19374219/how-to-find-the-difference-between-two-slices-of-strings
@@ -90,26 +97,31 @@ func joinStringSlice(a []string) string {
 
 // 指定したISBNの書誌情報を取得する
 func getBookInfo(isbn string) {
+  // 書誌情報
   var book BookInfo
+  // エラー件数
+  errorCount := 0
+
   params := url.Values{}
   params.Add("isbn", isbn)
 
+  // APIに書誌情報をリクエストする
   logMessage("send http request")
   resp, err := http.PostForm(openbdEndpoint + "/get", params)
   if err != nil {
-	  logMessage(fmt.Sprintf("%v", err))
+	  logMessage("error: " + fmt.Sprintf("%v", err))
     return
   }
   defer resp.Body.Close()
   
   jsonBlob, err := ioutil.ReadAll(resp.Body)
   var obj interface{}
+
+  // 取得したJSONをパース
   json.Unmarshal(jsonBlob, &obj)
 
   length := len(obj.([]interface{}))
   for i := 0; i < length; i++ {
-    // TODO dproxy なしの場合と性能比較する
-    // isbn := obj.([]interface{})[0].(map[string]interface{})["summary"].(map[string]interface{})["isbn"].(string)
     p := dproxy.New(obj).A(i)
     var d dproxy.Drain
 
@@ -126,6 +138,8 @@ func getBookInfo(isbn string) {
     book.Contents    = ""
 
     var ps dproxy.ProxySet
+
+    // Subject（主題、テーマ、カテゴリなど）を取得する
     ps = p.M("onix").M("DescriptiveDetail").M("Subject").ProxySet()
     if !ps.Empty() {
       for j := 0; j < ps.Len(); j++ {
@@ -140,6 +154,7 @@ func getBookInfo(isbn string) {
       }
     }
     
+    // TextContent（目次や内容紹介）を取得する
     ps = p.M("onix").M("CollateralDetail").M("TextContent").ProxySet()
     if !ps.Empty() {
       for j := 0; j < ps.Len(); j++ {
@@ -152,21 +167,105 @@ func getBookInfo(isbn string) {
       }
     }
 
+    // エラー発生時
     if err := d.CombineErrors(); err != nil {
-      logMessage(fmt.Sprintf("%v", err))
-      ps = p.M("onix").M("DescriptiveDetail").M("Subject").ProxySet()
-      fmt.Println("ps", ps)
-      //return
+      logMessage(fmt.Sprintf("error: %v", err))
+      errorCount = errorCount + 1
       continue
     }
+
+    // 書誌情報を更新する 
     InsertBook(book)
-    count++
-    //logMessage(count, total)
-    //logMessage(book)
   }
 
+  logMessage(fmt.Sprintf("insert errorCount: %d", errorCount))
 }
 
+// 指定したISBNの書誌情報を更新する
+func updateBookInfo(isbn string) {
+  // 書誌情報
+  var book BookInfo
+  // エラー件数
+  errorCount := 0
+
+  params := url.Values{}
+  params.Add("isbn", isbn)
+
+  // APIに書誌情報をリクエストする
+  logMessage("send http request")
+  resp, err := http.PostForm(openbdEndpoint + "/get", params)
+  if err != nil {
+	  logMessage("error: " + fmt.Sprintf("%v", err))
+    return
+  }
+  defer resp.Body.Close()
+
+  jsonBlob, err := ioutil.ReadAll(resp.Body)
+  var obj interface{}
+
+  // 取得したJSONをパース
+  json.Unmarshal(jsonBlob, &obj)
+
+  length := len(obj.([]interface{}))
+  for i := 0; i < length; i++ {
+    p := dproxy.New(obj).A(i)
+    var d dproxy.Drain
+
+    book.Isbn        = d.String(p.M("summary").M("isbn"))
+    book.Title       = d.String(p.M("summary").M("title"))
+    book.Author      = d.String(p.M("summary").M("author"))
+    book.Publisher   = d.String(p.M("summary").M("publisher"))
+    book.Pubdate     = d.String(p.M("summary").M("pubdate"))
+    book.Cover       = d.String(p.M("summary").M("cover"))
+    book.Keywords    = ""
+    book.Ccode       = ""
+    book.Genre       = ""
+    book.Description = ""
+    book.Contents    = ""
+
+    var ps dproxy.ProxySet
+
+    // Subject（主題、テーマ、カテゴリなど）を取得する
+    ps = p.M("onix").M("DescriptiveDetail").M("Subject").ProxySet()
+    if !ps.Empty() {
+      for j := 0; j < ps.Len(); j++ {
+        switch d.String(ps.A(j).M("SubjectSchemeIdentifier")) {
+          case "20":
+            book.Keywords = d.String(ps.A(j).M("SubjectHeadingText"))
+          case "78":
+            book.Ccode = d.String(ps.A(j).M("SubjectCode"))
+          case "79":
+            book.Genre = d.String(ps.A(j).M("SubjectCode"))
+        }
+      }
+    }
+
+    // TextContent（目次や内容紹介）を取得する
+    ps = p.M("onix").M("CollateralDetail").M("TextContent").ProxySet()
+    if !ps.Empty() {
+      for j := 0; j < ps.Len(); j++ {
+        switch d.String(ps.A(j).M("TextType")) {
+          case "03":
+            book.Description = d.String(ps.A(j).M("Text"))
+          case "04":
+            book.Contents = d.String(ps.A(j).M("Text"))
+        }
+      }
+    }
+
+    // エラー発生時
+    if err := d.CombineErrors(); err != nil {
+      logMessage("error: " + fmt.Sprintf("%v", err))
+      errorCount = errorCount + 1
+      continue
+    }
+
+    // 書誌情報を更新する 
+    UpdateBook(book)
+  }
+
+  logMessage(fmt.Sprintf("update errorCount: %d", errorCount))
+}
 // OpenBDからcoverageを取得する
 func getCoverage() []string {
   var coverage []string
@@ -186,7 +285,7 @@ func getCoverage() []string {
   return coverage
 }
 
-func logMessage(msg ...string) {
+func logMessage(msg string) {
   now := time.Now()
-  fmt.Println(now, msg)
+  fmt.Printf("[%s] %s\n", now.Format("20060102 15:04:05"), msg)
 }
